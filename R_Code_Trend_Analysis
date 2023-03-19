@@ -1,0 +1,174 @@
+
+#--------------------------------------------------------------------
+#  Setting the Working Directory
+#--------------------------------------------------------------------
+setwd("C:/Users/Yogi/Dropbox/PC/Downloads")
+
+
+#--------------------------------------------------------------------
+#  Loading all the Necessary Packages
+#--------------------------------------------------------------------
+library(ggplot2)
+library(tidyverse)
+library(tidyr)
+library(dplyr)
+library(readr)
+library(rlang)
+
+
+#--------------------------------------------------------------------
+#  Reading the Data Sets
+#--------------------------------------------------------------------
+GT_time <- read.csv("multiTimeline_gt.csv", header = TRUE) #Google Trends Data
+GT_region <- read.csv("GT_by_region.csv", header = TRUE) #Google Trends by region Data
+hdi <- read.csv("hdi.csv", header = TRUE) #human development index Data
+GDP <- read.csv("GDP.csv", header = TRUE) #GDP Data
+
+
+#--------------------------------------------------------------------
+#  Preprocess the Data
+#--------------------------------------------------------------------
+##Formatting column values
+GT_time$Week <- as.Date(GT_time$Week, format = "%d-%m-%Y") #formatting the date column from char
+view(GT_time)
+
+##Renaming the column names
+names(GT_time)[1] <- "week_start_date"    # using names() function to set the column name "week" as "week_start_date"
+names(GDP)[1] <- "Country"
+names(GDP)[2] <- "code"
+names(GDP)[3] <- "Ind_name"
+names(GDP)[4] <- "Ind_code"
+
+names(GT_region)[2] <- "Startup_Intensity"
+names(GT_region)[3] <- "Job_Intensity"
+
+names(GT_time)[2] <- "Startup_Intensity"
+names(GT_time)[3] <- "Job_Intensity"
+
+##filtering hdi data for 5 years
+hdi_5year <- filter(hdi, between(Year, 2016, 2021))
+
+names(hdi_5year)[1] <- "Country"
+names(hdi_5year)[4] <- "Human_Development_Index"
+
+##dropping the not needed columns
+GDP <- select(GDP, -code, -Ind_name, -Ind_code)
+hdi_5year <- select(hdi_5year, -Code)
+
+##Pivoting the GDP data in HDI data format
+GDP_5year <- pivot_longer(GDP, cols = -Country, names_to = "Year", values_to = "GDP")
+GDP_5year$Year <- substring(GDP_5year$Year, 2)
+
+##Merging data frames
+gdp_hdi_merged <- merge(GDP_5year, hdi_5year, by = c("Country", "Year"))
+
+length(unique(gdp_hdi_merged$Country))
+length(unique(GT_region$Country))
+
+##Remove all the rows where either of the two columns startup and job intensity are null,na,empty or have ""
+GT_region <- GT_region[apply(GT_region[, c("Startup_Intensity", "Job_Intensity")], 1, function(x) all(!is.na(x) & x != "")), ]
+rownames(GT_region) <- NULL
+
+
+#--------------------------------------------------------------------
+#  Analyze the Data -- ARIMA
+#--------------------------------------------------------------------
+
+# Load the forecast package
+library(forecast)
+library(lubridate)
+library(vars)
+
+# Convert the date column to a time series object
+ts_GT_data <- ts(GT_time$Startup_Intensity, start = c(year(GT_time$week_start_date[1]), 1), frequency = 52)
+ts_GT_data_1 <- ts(GT_time$Job_Intensity, start = c(year(GT_time$week_start_date[1]), 1), frequency = 52)
+
+
+# Fit an ARIMA model to the time series
+##var_model <- VAR(ts_GT_data, p = 1)
+arima_model <- Arima(ts_GT_data, order = c(1,1,1))
+arima_model_1 <- Arima(ts_GT_data_1, order = c(1,1,1))
+
+# Print the model summary
+summary(arima_model)
+summary(arima_model_1)
+  
+#--------------------------------------------------------------------
+#  Analyze the Data -- Regression
+#--------------------------------------------------------------------
+  
+## Calculate averages of hdi and gdp by Country
+hdi_gdp_avg <- gdp_hdi_merged %>% 
+  group_by(Country) %>% 
+  summarise(gdp_avg = mean(GDP), hdi_avg = mean(Human_Development_Index))
+
+## merging Google trends by region and gdp and hdi data on country level to do regression analysis
+GT_GDP_hdi_merge <- merge(hdi_gdp_avg, GT_region, by = "Country")
+
+library(lmtest)
+
+model <- lm(Job_Intensity ~ Startup_Intensity + gdp_avg, data = GT_GDP_hdi_merge)
+summary(model)
+coeftest(model)
+
+#--------------------------------------------------------------------
+#  Analyze the Data -- Colinearity Check
+#--------------------------------------------------------------------
+
+### Transform variables from percent to numeric
+
+#### removing "%" from the values
+GT_GDP_hdi_merge$Startup_Intensity <- substr(GT_GDP_hdi_merge$Startup_Intensity, 1, nchar(GT_GDP_hdi_merge$Startup_Intensity)-1)
+GT_GDP_hdi_merge$Job_Intensity <- substr(GT_GDP_hdi_merge$Job_Intensity, 1, nchar(GT_GDP_hdi_merge$Job_Intensity)-1)
+
+GT_GDP_hdi_merge$Startup_Intensity <- as.numeric(GT_GDP_hdi_merge$Startup_Intensity)
+GT_GDP_hdi_merge$Job_Intensity <- as.numeric(GT_GDP_hdi_merge$Job_Intensity)
+
+
+#### colinearity check
+cor(GT_GDP_hdi_merge[c("Startup_Intensity", "Job_Intensity", "gdp_avg")])
+
+
+#--------------------------------------------------------------------
+#  Analyze the Data -- categorization of countries as Developed and Developing
+#--------------------------------------------------------------------
+
+## Calculate median values of HDI and GDP per capita
+hdi_median <- median(GT_GDP_hdi_merge$hdi_avg)
+gdp_median <- median(GT_GDP_hdi_merge$gdp_avg)
+
+## Create new column for country classification
+GT_GDP_hdi_merge <- GT_GDP_hdi_merge %>%
+  mutate(Classification = ifelse(hdi_avg >= hdi_median & gdp_avg >= gdp_median,
+                                 "Developed", "Developing"))
+
+## Compare average startup searches and job prevalence between country groups
+startup_by_class <- tapply(GT_GDP_hdi_merge$Startup_Intensity, GT_GDP_hdi_merge$Classification, mean)
+job_by_class <- tapply(GT_GDP_hdi_merge$Job_Intensity, GT_GDP_hdi_merge$Classification, mean)
+t_test <- t.test(GT_GDP_hdi_merge$Startup_Intensity ~ GT_GDP_hdi_merge$Classification)
+
+t_test
+
+
+
+#--------------------------------------------------------------------
+#  Analyze the Data -- creating visualizations
+#--------------------------------------------------------------------
+
+# Count number of countries in each classification group
+class_counts <- table(GT_GDP_hdi_merge$Classification)
+
+# Convert to data frame
+class_counts_df <- data.frame(Classification = names(class_counts), Count = as.vector(class_counts))
+
+# Create bar chart
+ggplot(data = class_counts_df, aes(x = Classification, y = Count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Country Classification", x = "Classification", y = "Country Count")
+
+
+
+
+ggplot(GT_GDP_hdi_merge, aes(x = Classification, y = Startup_Intensity)) +
+  geom_boxplot()
+
